@@ -4,85 +4,103 @@
         exit('Direct access not allowed');
     }
 
-    if(isset($_POST['test_databse_request'])){
-        $host        = $_POST['dbHost'] ?? '';
-        $port        = $_POST['dbPort'] ?? '3306';
-        $dbname      = $_POST['dbName'] ?? '';
-        $username    = $_POST['dbUsername'] ?? '';
-        $password    = $_POST['dbPassword'] ?? '';
-        $tablePrefix = $_POST['tablePrefix'] ?? '';
-
-        if (!$host || !$dbname || !$username) {
-            echo json_encode(['status' => 'false', 'message' => 'Please fill in all required fields.']);
-            exit;
-        }
-
-        if (!in_array('mysql', PDO::getAvailableDrivers())) {
-            echo json_encode(['status' => 'false', 'message' => 'PDO MySQL driver is not enabled on this server.']);
-            exit;
-        }
-
-        if($requriemntnoneedchecked == false){
-            echo json_encode([
-                'status'  => 'false',
-                'title'   => 'Server Requirements Not Met',
-                'message' => 'Your server does not meet the minimum requirements. Please enable the required PHP extensions and try again.'
-            ]);
-            exit;
-        }
+    if (isset($_POST['test_databse_request'])) {
+        header('Content-Type: application/json; charset=utf-8');
+        $pdo = null;
 
         try {
-            $dsn = "mysql:host=$host;port=$port;dbname=$dbname;charset=utf8mb4";
-            $pdo = new PDO($dsn, $username, $password, [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_AUTOCOMMIT => false
-            ]);
+            $host = trim((string)($_POST['dbHost'] ?? ''));
+            $port = (int)($_POST['dbPort'] ?? 3306);
+            $dbname = trim((string)($_POST['dbName'] ?? ''));
+            $username = trim((string)($_POST['dbUsername'] ?? ''));
+            $password = (string)($_POST['dbPassword'] ?? '');
+            $tablePrefix = trim((string)($_POST['tablePrefix'] ?? 'pp_'));
 
-            // Read SQL file
-            $sqlContent = file_get_contents(__DIR__ . '/db.sql');
-            if ($sqlContent === false) {
-                throw new Exception("SQL file not found or empty.");
+            if ($host === '' || $dbname === '' || $username === '') {
+                throw new RuntimeException('Host, database name and username are required.');
+            }
+            if ($port < 1 || $port > 65535) {
+                throw new RuntimeException('Database port is invalid.');
+            }
+            if (!in_array('mysql', PDO::getAvailableDrivers(), true)) {
+                throw new RuntimeException('PDO MySQL driver is not enabled on this server.');
+            }
+            if (isset($requriemntnoneedchecked) && $requriemntnoneedchecked === false) {
+                throw new RuntimeException('Server requirements are not satisfied.');
+            }
+            if ($tablePrefix !== '' && !preg_match('/^[A-Za-z0-9_]+$/', $tablePrefix)) {
+                throw new RuntimeException('Table prefix may contain only letters, numbers and underscores.');
             }
 
-            if (!empty($tablePrefix) && $tablePrefix !== 'pp_') {
+            $dsn = "mysql:host={$host};port={$port};dbname={$dbname};charset=utf8mb4";
+            $options = [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+                PDO::ATTR_TIMEOUT => 15
+            ];
+
+            // Optional CA certificate path configured in Render environment variables.
+            $caFile = getenv('MYSQL_ATTR_SSL_CA');
+            if ($caFile !== false && $caFile !== '' && is_readable($caFile)) {
+                if (defined('PDO::MYSQL_ATTR_SSL_CA')) {
+                    $options[PDO::MYSQL_ATTR_SSL_CA] = $caFile;
+                }
+                if (defined('PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT')) {
+                    $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = true;
+                }
+            }
+
+            $pdo = new PDO($dsn, $username, $password, $options);
+
+            $sqlFile = __DIR__ . '/db.sql';
+            if (!is_readable($sqlFile)) {
+                throw new RuntimeException('Installer SQL file db.sql is missing or unreadable.');
+            }
+            $sqlContent = file_get_contents($sqlFile);
+            if ($sqlContent === false || trim($sqlContent) === '') {
+                throw new RuntimeException('Installer SQL file is empty or unreadable.');
+            }
+
+            if ($tablePrefix !== '' && $tablePrefix !== 'pp_') {
                 $sqlContent = str_replace('pp_', $tablePrefix, $sqlContent);
             }
 
-            $queries = array_filter(array_map('trim', explode(";\n", $sqlContent)));
-
-            // Start transaction AFTER SQL is prepared
-            $pdo->beginTransaction();
-
+            // This matches the project's SQL file convention (statements ending in ; followed by a newline).
+            $queries = preg_split('/;\s*(?:\r?\n|$)/', trim($sqlContent));
             foreach ($queries as $query) {
+                $query = trim($query);
                 if ($query !== '') {
                     $pdo->exec($query);
                 }
             }
 
-            if ($pdo->inTransaction()) {
-                $pdo->commit();
+            $configContent = "<?php\n"
+                . '$db_host = ' . var_export($host, true) . ";\n"
+                . '$db_port = ' . var_export((string)$port, true) . ";\n"
+                . '$db_user = ' . var_export($username, true) . ";\n"
+                . '$db_pass = ' . var_export($password, true) . ";\n"
+                . '$db_name = ' . var_export($dbname, true) . ";\n"
+                . '$db_prefix = ' . var_export($tablePrefix, true) . ";\n";
+
+            $configPath = __DIR__ . '/../../pp-temp-config.php';
+            if (file_put_contents($configPath, $configContent, LOCK_EX) === false) {
+                throw new RuntimeException('Database was reached, but the temporary config file could not be written. Check filesystem permissions.');
             }
 
-            // Write config file
-            $configContent = "<?php
-    \$db_host = '".addslashes($host). "';
-    \$db_port = '" . addslashes($port) . "'; 
-    \$db_user = '".addslashes($username)."';
-    \$db_pass = '".addslashes($password)."';
-    \$db_name = '".addslashes($dbname)."';
-    \$db_prefix = '".addslashes($tablePrefix)."';
-?>";
-
-            file_put_contents(__DIR__ . '/../../pp-temp-config.php', $configContent);
-
-            echo json_encode(['status' => 'true', 'title' => 'Imported successfully', 'message' => 'Database connection verified and imported successfully.']);
+            echo json_encode([
+                'status' => 'true',
+                'title' => 'Database connection successful',
+                'message' => 'Database connection and SQL import completed.'
+            ]);
         } catch (Throwable $e) {
-            if (isset($pdo) && $pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
-
-            echo json_encode(['status' => 'false', 'title' => 'Database Error', 'message' => $e->getMessage()]);
+            error_log('PipraPay installer database error: ' . $e->getMessage());
+            http_response_code(500);
+            echo json_encode([
+                'status' => 'false',
+                'title' => 'Database setup failed',
+                'message' => $e->getMessage()
+            ]);
         }
         exit;
     }
@@ -577,6 +595,19 @@
            }
         ?>
 
+        function showInstallDebug(message) {
+            let box = document.getElementById('install-debug-message');
+            if (!box) {
+                box = document.createElement('pre');
+                box.id = 'install-debug-message';
+                box.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;background:#fff0f0;color:#8b0000;padding:12px;margin:12px 0;border:1px solid #dc3545;border-radius:8px;font-size:13px;';
+                const button = document.getElementById('btnTestConnection');
+                if (button) button.insertAdjacentElement('afterend', box);
+            }
+            box.textContent = message;
+            box.scrollIntoView({behavior: 'smooth', block: 'center'});
+        }
+
         $(document).ready(function() {
             $('.database-config-extra input[name="dbDriver"]').on('change', function () {
                 $('.database-config-extra input[name="dbDriver"]').not(this).prop('checked', false);
@@ -584,6 +615,8 @@
 
             $('#btnTestConnection').on('click', function () {
 
+                $('#install-debug-message').remove();
+                $('#btnNextToAdmin').prop('disabled', true);
                 let btn = $('.test-connection-btn');
 
                 let driver = $('input[name="dbDriver"]:checked').val();
@@ -612,7 +645,7 @@
                 btn.html('<span class="spinner-border spinner-border-sm"></span>');
 
                 $.ajax({
-                    url: 'install',
+                    url: window.location.pathname + window.location.search,
                     type: 'POST',
                     data: data,
                     dataType: 'json',
@@ -630,6 +663,8 @@
                                 top: 20
                             });
                         } else {
+                            $('#btnNextToAdmin').prop('disabled', true);
+                            showInstallDebug((response.title || 'Database Error') + ': ' + (response.message || 'Unknown error'));
                             createToast({
                                 title: 'Action Required',
                                 description: `${response.message}`,
@@ -640,13 +675,15 @@
                         }
                     },
                     error: function (xhr, status, error) {
-                        console.log('AJAX Error:');
-                        console.log('Status:', status);
-                        console.log('Error:', error);            
-                        console.log('Response Text:', xhr.responseText); 
-                        console.log('XHR Object:', xhr);          
-
                         btn.text('Check & Import');
+                        $('#btnNextToAdmin').prop('disabled', true);
+                        let message = 'Request failed.\nHTTP status: ' + xhr.status + '\nRequest status: ' + status + '\nError: ' + (error || 'Unknown error');
+                        if (xhr.responseJSON && xhr.responseJSON.message) {
+                            message += '\nServer: ' + xhr.responseJSON.message;
+                        } else if (xhr.responseText) {
+                            message += '\nResponse: ' + xhr.responseText.substring(0, 1200);
+                        }
+                        showInstallDebug(message);
 
                         createToast({
                             title: 'Action Required',
@@ -703,7 +740,7 @@
 
                 $.ajax({
                     type: 'POST',
-                    url: 'install', 
+                    url: window.location.pathname + window.location.search, 
                     data: formData,
                     dataType: 'json',
                     success: function(response) {
